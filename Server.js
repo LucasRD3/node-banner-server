@@ -1,9 +1,10 @@
-// server.js (ATUALIZADO PARA VERCEL)
+// server.js (ATUALIZADO PARA VERCEL + LUXON)
 
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
 const cors = require('cors'); 
+const { DateTime } = require('luxon'); // ✅ NOVO: Importa Luxon
 const app = express();
 
 // --- REMOVIDO: Porta Dinâmica (Não é necessário em Serverless Functions) ---
@@ -21,20 +22,19 @@ app.use(express.static(path.join(__dirname, 'banners')));
 // =========================================================================
 
 /**
- * Mapeia o dia da semana (retornado por new Date().getDay()) para o nome 
+ * Mapeia o dia da semana (retornado por new Date().getDay() ou Luxon) para o nome 
  * do arquivo de banner correspondente.
- * * Dias (JavaScript): 0=Domingo, 1=Segunda, 2=Terça, 3=Quarta, 4=Quinta, 5=Sexta, 6=Sábado.
- * * IMPORTANTE: Todos os arquivos agora estão padronizados para a extensão .png.
- * * Eles DEVEM existir na pasta /banners.
+ * * Dias (JavaScript/Luxon): 1=Segunda, 2=Terça... 6=Sábado, 7=Domingo.
+ * * NOTA: O Luxon usa 1-7, diferente do padrão JS (0-6). Mapeamento ajustado.
  */
 const BannerDoDia = {
-    0: 'banner_domingo.png',  // Domingo (Day 0)
-    1: 'banner_segunda.png',  // Segunda-feira (Day 1)
-    2: 'banner_terca.png',    // Terça-feira (Day 2)
-    3: 'banner_quarta.png',   // Quarta-feira (Day 3)
-    4: 'banner_quinta.png',   // Quinta-feira (Day 4)
-    5: 'banner_sexta.png',    // Sexta-feira (Day 5)
-    6: 'banner_sabado.png'    // Sábado (Day 6)
+    7: 'banner_domingo.png',  // Domingo (Day 7 em Luxon)
+    1: 'banner_segunda.png',  // Segunda-feira (Day 1 em Luxon)
+    2: 'banner_terca.png',    // Terça-feira (Day 2 em Luxon)
+    3: 'banner_quarta.png',   // Quarta-feira (Day 3 em Luxon)
+    4: 'banner_quinta.png',   // Quinta-feira (Day 4 em Luxon)
+    5: 'banner_sexta.png',    // Sexta-feira (Day 5 em Luxon)
+    6: 'banner_sabado.png'    // Sábado (Day 6 em Luxon)
 };
 
 
@@ -42,7 +42,9 @@ const BannerDoDia = {
 // Esta rota retorna: 1. O Banner do Dia (se houver), seguido por 2. Outros Banners Genéricos.
 app.get('/api/banners', (req, res) => {
     const bannersDir = path.join(__dirname, 'banners');
-    const today = new Date().getDay(); // Obtém o dia atual (0 a 6)
+    
+    // 🎯 NOVO: Obtém o dia atual no fuso horário específico (America/Sao_Paulo)
+    const today = DateTime.local().setZone('America/Sao_Paulo').weekday; // 1 (Seg) a 7 (Dom)
     
     // Nome do arquivo esperado para o dia de hoje
     const bannerFilenameToday = BannerDoDia[today]; 
@@ -50,7 +52,6 @@ app.get('/api/banners', (req, res) => {
     const allDailyBanners = Object.values(BannerDoDia); 
     
     // --- ✅ AJUSTE VERCEL: A URL base é inferida. ---
-    // Usar 'req.protocol + '://' + req.get('host')' é a forma correta no ambiente Vercel.
     const baseUrl = req.protocol + '://' + req.get('host');
 
     fs.readdir(bannersDir, (err, files) => {
@@ -88,7 +89,15 @@ app.get('/api/banners', (req, res) => {
             console.log("Nenhum banner encontrado ou mapeado para hoje.");
         }
 
-        res.json({ banners: finalBannerUrls });
+        res.json({ 
+            banners: finalBannerUrls,
+            // ℹ️ Adiciona o dia e o fuso horário atual à resposta para debug/verificação
+            debug: {
+                currentDay: today,
+                timezone: 'America/Sao_Paulo',
+                expectedBanner: bannerFilenameToday || 'Nenhum'
+            }
+        });
     });
 });
 
