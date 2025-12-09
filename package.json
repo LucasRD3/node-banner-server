@@ -16,7 +16,8 @@
     "express": "^5.1.0",
     "luxon": "^3.4.4",
     "multer": "^1.4.5-lts.1",
-    "node-fetch": "^2.6.1"
+    "node-fetch": "^2.6.1",
+    "ioredis": "^5.3.2"
   },
   "devDependencies": {
     "@vercel/node": "^3.1.5"

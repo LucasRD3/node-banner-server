@@ -1,15 +1,27 @@
-// server.js (CONTROLE INDIVIDUAL POR ARQUIVO DINÂMICO COM CLOUDINARY)
+// server.js (AGORA USANDO UPSTASH REDIS EM VEZ DE JSONBIN)
 
 const express = require('express');
 const cors = require('cors'); 
 const { DateTime } = require('luxon');
-const fetch = require('node-fetch'); 
+const fetch = require('node-fetch'); // Mantido, mas não usado para o estado
 const cloudinary = require('cloudinary').v2;
 const multer = require('multer');           
+const Redis = require('ioredis'); // NOVO: Importa ioredis
 const app = express();
 
 app.use(express.json()); 
 app.use(cors()); 
+
+// =========================================================================
+// === CONFIGURAÇÃO UPSTASH REDIS ===
+// =========================================================================
+
+// Conecta ao Upstash usando a URL completa (process.env.REDIS_URL deve ser definido no Vercel)
+// O valor deve ser algo como: redis://default:<PASSWORD>@<HOST>:<PORT>
+const redisClient = new Redis(process.env.REDIS_URL); 
+
+// Chave única onde o objeto de configuração JSON será armazenado no Redis
+const REDIS_CONFIG_KEY = 'global:banner_config_state';
 
 // --- CONFIGURAÇÃO CLOUDINARY ---
 cloudinary.config({
@@ -23,41 +35,53 @@ const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
 // =========================================================================
-// === FUNÇÕES DE CONFIGURAÇÃO REMOTA (JSONBIN) ===
+// === FUNÇÕES DE CONFIGURAÇÃO REMOTA (REDIS) ===
 // =========================================================================
 
-const JSONBIN_URL = `https://api.jsonbin.io/v3/b/${process.env.JSONBIN_BIN_ID}/latest`;
-const JSONBIN_WRITE_URL = `https://api.jsonbin.io/v3/b/${process.env.JSONBIN_BIN_ID}`;
-
+/**
+ * Busca a configuração de banners do Redis.
+ * @returns {Promise<{specific_banners: Object}>} Configuração atual.
+ */
 async function getBannerConfig() {
-    // Estrutura simplificada, sem banners diários
     const defaultFallback = { specific_banners: {} }; 
     
-    // MELHORIA: Verifica se o ID existe antes de tentar o fetch e evita ID muito curto
-    if (!process.env.JSONBIN_BIN_ID || process.env.JSONBIN_BIN_ID.length < 5) { //
-        console.warn('JSONBIN_BIN_ID não está configurado. Retornando configuração padrão.'); //
-        return defaultFallback;
-    }
-    
     try {
-        const response = await fetch(JSONBIN_URL);
+        // 1. Pega a string JSON do Redis
+        const configString = await redisClient.get(REDIS_CONFIG_KEY);
         
-        if (!response.ok) {
-            console.error(`Falha na API JSON Bin. Status: ${response.status}.`); //
-            // Se o status for 400 (Bad Request), é um ID inválido
-            if (response.status === 400) { //
-                 console.error('VERIFIQUE JSONBIN_BIN_ID: O servidor JSON Bin retornou 400 Bad Request (Provavelmente ID Inválido).'); //
-            }
+        if (configString) {
+            // 2. Converte a string de volta para objeto
+            const data = JSON.parse(configString);
+            return { 
+                specific_banners: data.specific_banners || {} 
+            }; 
         }
         
-        const data = await response.json();
-        
-        return data.record ? { 
-            specific_banners: data.record.specific_banners || {} 
-        } : defaultFallback; 
-    } catch (error) {
-        console.error('Falha ao buscar estado de banners no JSON Bin:', error.message);
+        // 3. Se não houver dados, retorna o fallback e salva (inicia) no Redis
+        await setBannerConfig(defaultFallback);
         return defaultFallback; 
+    } catch (error) {
+        console.error('Falha ao buscar estado de banners no Redis:', error.message);
+        return defaultFallback; 
+    }
+}
+
+/**
+ * Salva a nova configuração no Redis.
+ * @param {Object} config - O objeto de configuração a ser salvo.
+ * @returns {Promise<void>}
+ */
+async function setBannerConfig(config) {
+    try {
+        // 1. Converte o objeto de configuração para string JSON
+        const configString = JSON.stringify(config);
+        
+        // 2. Salva a string no Redis
+        await redisClient.set(REDIS_CONFIG_KEY, configString);
+        
+    } catch (error) {
+        console.error('Falha ao salvar estado de banners no Redis:', error.message);
+        throw new Error('Falha ao salvar configuração no banco de dados.'); 
     }
 }
 
@@ -92,25 +116,11 @@ app.post('/api/banners/upload', upload.single('bannerFile'), async (req, res) =>
         newConfig.specific_banners[newBannerUrl] = {
             publicId: newBannerPublicId,
             day: 'random', 
-            priority: 999 // NOVO: Prioridade baixa por padrão (aparecerá por último)
+            priority: 999 // NOVO: Prioridade baixa por padrão
         }; 
         
-        // 4. Salva a nova configuração no JSON Bin
-        const jsonBinResponse = await fetch(JSONBIN_WRITE_URL, {
-            method: 'PUT',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-Master-Key': process.env.JSONBIN_MASTER_KEY 
-            },
-            body: JSON.stringify(newConfig)
-        });
-        
-        if (!jsonBinResponse.ok) {
-            const errorBody = await jsonBinResponse.text();
-            // MELHORIA: Log do corpo do erro
-            console.error('JSON BIN WRITE ERROR BODY:', errorBody); //
-            throw new Error(`Falha ao atualizar JSON Bin após upload. Status: ${jsonBinResponse.status}. Body: ${errorBody}`);
-        }
+        // 4. Salva a nova configuração no REDIS (SUBSTITUINDO JSONBIN)
+        await setBannerConfig(newConfig);
 
         res.json({ 
             success: true, 
@@ -120,7 +130,7 @@ app.post('/api/banners/upload', upload.single('bannerFile'), async (req, res) =>
         });
         
     } catch (error) {
-        console.error('Erro no upload para Cloudinary/JSON Bin:', error);
+        console.error('Erro no upload para Cloudinary/Redis:', error);
         res.status(500).json({ success: false, error: `Falha interna ao salvar configuração: ${error.message}` });
     }
 });
@@ -179,7 +189,7 @@ app.get('/api/config/banners/list', async (req, res) => {
     
     let bannerList = [];
 
-    // 1. Adiciona Banners Genéricos (lidos do JSON Bin/Cloudinary)
+    // 1. Adiciona Banners Genéricos (lidos do Cloudinary/Redis)
     Object.keys(specificStatuses).forEach(url => {
         const bannerConfig = specificStatuses[url];
         
@@ -217,9 +227,6 @@ app.put('/api/config/banners', async (req, res) => {
         return res.status(400).json({ success: false, error: 'O campo "active" deve ser booleano e "file" (URL) deve ser fornecido.' });
     }
 
-    const url = JSONBIN_WRITE_URL; 
-    const apiKey = process.env.JSONBIN_MASTER_KEY; 
-    
     try {
         const currentConfig = await getBannerConfig();
         const newConfig = { ...currentConfig };
@@ -248,20 +255,9 @@ app.put('/api/config/banners', async (req, res) => {
             newConfig.specific_banners[file] = false;
         }
 
+        // SALVA NO REDIS (SUBSTITUINDO JSONBIN)
+        await setBannerConfig(newConfig);
 
-        const response = await fetch(url, {
-            method: 'PUT',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-Master-Key': process.env.JSONBIN_MASTER_KEY 
-            },
-            body: JSON.stringify(newConfig) 
-        });
-
-        if (!response.ok) {
-            const errorBody = await response.text();
-            throw new Error(`Falha ao atualizar JSON Bin. Status: ${response.status}. Body: ${errorBody}`);
-        }
 
         // Retorna a nova config para confirmação
         const updatedConfig = newConfig.specific_banners[file] === false ? { day: baseConfig.day || 'random', priority: baseConfig.priority || 999 } : newConfig.specific_banners[file];
@@ -275,73 +271,9 @@ app.put('/api/config/banners', async (req, res) => {
             message: `Configuração do banner ${file} atualizada com sucesso.` 
         });
     } catch (error) {
-        console.error('Erro de escrita no JSON Bin:', error);
+        console.error('Erro de escrita no Redis:', error);
         res.status(500).json({ success: false, error: `Falha interna ao salvar configuração: ${error.message}` });
     }
 });
-
-// --- ROTA 4: API PARA EXCLUIR PERMANENTEMENTE UM BANNER (CLOUDINARY E JSON BIN) ---
-app.delete('/api/banners/delete', async (req, res) => { //
-    const { fileUrl } = req.body; 
-
-    if (!fileUrl) {
-        return res.status(400).json({ success: false, error: 'URL do arquivo (fileUrl) é obrigatória para exclusão.' });
-    }
-    
-    // Expressão regular para extrair o Public ID do Cloudinary da URL
-    // Exemplo: 'site_banners/abcdefg123'
-    const match = fileUrl.match(/\/site_banners\/([^/.]+)/); //
-    const publicId = match ? `site_banners/${match[1]}` : null;
-    
-    if (!publicId) {
-         return res.status(400).json({ success: false, error: 'Não foi possível extrair o Cloudinary Public ID da URL fornecida.' });
-    }
-
-    try {
-        // 1. Excluir do Cloudinary
-        const cloudinaryResult = await cloudinary.uploader.destroy(publicId); //
-
-        if (cloudinaryResult.result !== 'ok' && cloudinaryResult.result !== 'not found') {
-            console.warn(`Cloudinary não retornou 'ok' ou 'not found' para ${publicId}:`, cloudinaryResult.result);
-            // Continua, mas loga o aviso.
-        }
-
-        // 2. Remover da configuração JSON Bin
-        const currentConfig = await getBannerConfig();
-        const newConfig = { ...currentConfig };
-        
-        if (newConfig.specific_banners && newConfig.specific_banners.hasOwnProperty(fileUrl)) { //
-            delete newConfig.specific_banners[fileUrl];
-        } else {
-             console.warn(`URL do banner ${fileUrl} não encontrada no JSON Bin para remoção.`);
-        }
-        
-        // 3. Salvar a nova configuração no JSON Bin
-        const jsonBinResponse = await fetch(JSONBIN_WRITE_URL, {
-            method: 'PUT',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-Master-Key': process.env.JSONBIN_MASTER_KEY 
-            },
-            body: JSON.stringify(newConfig)
-        });
-        
-        if (!jsonBinResponse.ok) {
-            const errorBody = await jsonBinResponse.text();
-            console.error('JSON BIN WRITE ERROR BODY (DELETE):', errorBody); 
-            throw new Error(`Falha ao atualizar JSON Bin após exclusão. Status: ${jsonBinResponse.status}. Body: ${errorBody}`);
-        }
-
-        res.json({ 
-            success: true, 
-            message: `Banner ${publicId} excluído com sucesso do Cloudinary e da configuração.`
-        });
-        
-    } catch (error) {
-        console.error('Erro na exclusão para Cloudinary/JSON Bin:', error);
-        res.status(500).json({ success: false, error: `Falha interna ao excluir banner: ${error.message}` });
-    }
-});
-// FIM DA NOVA ROTA DELETE
 
 module.exports = app;
