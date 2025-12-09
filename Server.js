@@ -1,4 +1,4 @@
-// server.js (CONTROLE INDIVIDUAL POR ARQUIVO DINÂMICO COM CLOUDINARY)
+// Server.js (CONTROLE INDIVIDUAL POR ARQUIVO DINÂMICO COM CLOUDINARY)
 
 const express = require('express');
 const path = require('path');
@@ -6,8 +6,8 @@ const fs = require('fs');
 const cors = require('cors'); 
 const { DateTime } = require('luxon');
 const fetch = require('node-fetch'); 
-const cloudinary = require('cloudinary').v2; // Adição Cloudinary
-const multer = require('multer');           // Adição Multer
+const cloudinary = require('cloudinary').v2;
+const multer = require('multer');           
 const app = express();
 
 app.use(express.json()); 
@@ -15,7 +15,7 @@ app.use(cors());
 // Mantém o acesso estático para os banners diários (que ainda estão no disco)
 app.use(express.static(path.join(__dirname, 'banners'))); 
 
-// --- CONFIGURAÇÃO CLOUDINARY ---
+// --- CONFIGURAÇÃO CLOUDINARY (Lê as Variáveis de Ambiente) ---
 cloudinary.config({
     cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
     api_key: process.env.CLOUDINARY_API_KEY,
@@ -23,7 +23,6 @@ cloudinary.config({
 });
 
 // Configuração do Multer: Armazena o arquivo na memória temporariamente
-// (Crucial para ambientes Serverless como o Vercel)
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
@@ -72,16 +71,14 @@ app.post('/api/banners/upload', upload.single('bannerFile'), async (req, res) =>
     }
     
     try {
-        // Converte o buffer de memória em base64 para o Cloudinary
         const fileBase64 = `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}`;
 
         // 1. Upload para o Cloudinary
         const result = await cloudinary.uploader.upload(fileBase64, {
-            folder: 'site_banners', // Pasta no Cloudinary
+            folder: 'site_banners', 
         });
 
         const newBannerUrl = result.secure_url;
-        // O Public ID pode ser útil para exclusão futura, mas salvamos a URL como chave.
         const newBannerPublicId = result.public_id; 
 
         // 2. Busca a configuração atual
@@ -92,8 +89,6 @@ app.post('/api/banners/upload', upload.single('bannerFile'), async (req, res) =>
         newConfig.specific_banners = newConfig.specific_banners || {};
         newConfig.specific_banners[newBannerUrl] = newBannerPublicId; 
         
-        // O banner é ativado por padrão ao ser adicionado
-
         // 4. Salva a nova configuração no JSON Bin
         const jsonBinResponse = await fetch(JSONBIN_WRITE_URL, {
             method: 'PUT',
@@ -123,12 +118,70 @@ app.post('/api/banners/upload', upload.single('bannerFile'), async (req, res) =>
 });
 
 
+// --- NOVO: ROTA PARA EXCLUIR BANNER PERMANENTEMENTE ---
+app.delete('/api/banners/delete', async (req, res) => {
+    // Espera { "fileUrl": "url_completa_do_cloudinary" } no corpo da requisição DELETE
+    const { fileUrl } = req.body;
+    
+    if (!fileUrl) {
+        return res.status(400).json({ success: false, error: 'URL do arquivo (fileUrl) é obrigatória.' });
+    }
+
+    try {
+        // 1. Busca a configuração atual para obter o Public ID
+        const currentConfig = await getBannerConfig();
+        const specificBanners = currentConfig.specific_banners || {};
+        
+        // A URL é a chave; o valor é o Public ID (ou false se desativado)
+        const publicId = specificBanners[fileUrl]; 
+
+        if (!publicId && publicId !== false) {
+             return res.status(404).json({ success: false, error: 'Banner não encontrado na configuração do JSON Bin.' });
+        }
+        
+        // 2. Exclusão no Cloudinary
+        if (publicId && publicId !== false) { 
+            console.log(`Excluindo Public ID ${publicId} do Cloudinary...`);
+            await cloudinary.uploader.destroy(publicId);
+        }
+
+        // 3. Excluir a entrada (URL) da configuração do JSON Bin
+        const newConfig = { ...currentConfig };
+        delete newConfig.specific_banners[fileUrl];
+        
+        // 4. Salvar a nova configuração no JSON Bin
+        const jsonBinResponse = await fetch(JSONBIN_WRITE_URL, {
+            method: 'PUT',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Master-Key': process.env.JSONBIN_MASTER_KEY
+            },
+            body: JSON.stringify(newConfig)
+        });
+        
+        if (!jsonBinResponse.ok) {
+            const errorBody = await jsonBinResponse.text();
+            throw new Error(`Falha ao atualizar JSON Bin após exclusão. Status: ${jsonBinResponse.status}. Body: ${errorBody}`);
+        }
+
+        res.json({ 
+            success: true, 
+            message: `Banner excluído permanentemente (Cloudinary e JSON Bin).`, 
+            fileUrl: fileUrl
+        });
+
+    } catch (error) {
+        console.error('Erro na exclusão permanente:', error);
+        res.status(500).json({ success: false, error: `Falha interna na exclusão: ${error.message}` });
+    }
+});
+
+
 // --- ROTA 1: API PARA OBTER OS BANNERS ATIVOS (CONSUMO DO CLIENTE) ---
 app.get('/api/banners', async (req, res) => {
     
     const config = await getBannerConfig();
     const isDailyActive = config.daily_banners_active;
-    // specificStatuses agora contém URLs do Cloudinary como chaves
     const specificStatuses = config.specific_banners || {}; 
     
     const today = DateTime.local().setZone('America/Sao_Paulo').weekday; 
@@ -139,7 +192,6 @@ app.get('/api/banners', async (req, res) => {
     // 1. Processa Banner do Dia (Lê do disco local se ativo)
     if (isDailyActive && bannerFilenameToday) {
          const dailyBannerPath = path.join(__dirname, 'banners', bannerFilenameToday);
-         // Verifica se o arquivo diário existe antes de incluir
          if (fs.existsSync(dailyBannerPath)) {
             finalBannerUrls.push(`${baseUrl}/${bannerFilenameToday}`);
          }
@@ -151,14 +203,12 @@ app.get('/api/banners', async (req, res) => {
         const isActive = specificStatuses[url] !== false; 
         
         if (isActive) {
-            // Adiciona o URL do Cloudinary diretamente
             finalBannerUrls.push(url);
         }
     });
     
     res.json({ 
         banners: [...new Set(finalBannerUrls)],
-        // Informações de debug/status podem ser úteis
         debug: {
             currentDay: today,
             timezone: 'America/Sao_Paulo',
@@ -169,13 +219,11 @@ app.get('/api/banners', async (req, res) => {
 });
 
 // --- ROTA 2: API PARA OBTER LISTA COMPLETA DE BANNERS E STATUS (PAINEL) ---
-// Esta rota precisa combinar Banners Diários (do disco) com Banners Cloudinary (do JSON Bin)
 app.get('/api/config/banners/list', async (req, res) => {
     const bannersDir = path.join(__dirname, 'banners');
     const config = await getBannerConfig(); 
     const specificStatuses = config.specific_banners || {};
     
-    // Lista para banners diários (lidos do disco)
     let bannerList = [];
 
     // 1. Adiciona Banners Diários (lidos do disco)
@@ -187,7 +235,6 @@ app.get('/api/config/banners/list', async (req, res) => {
             bannerList.push({
                 fileName: file,
                 isDailyBanner: true,
-                // Status reflete o controle global
                 isActive: config.daily_banners_active !== false 
             });
         });
@@ -196,13 +243,10 @@ app.get('/api/config/banners/list', async (req, res) => {
     }
     
     // 2. Adiciona Banners Genéricos (lidos do JSON Bin/Cloudinary)
-    // As chaves são os URLs completos do Cloudinary.
     Object.keys(specificStatuses).forEach(url => {
-        // O banner é considerado ativo se o valor não for 'false'.
         const isActive = specificStatuses[url] !== false; 
         
         bannerList.push({
-            // O fileName é o URL do Cloudinary para o painel
             fileName: url, 
             isDailyBanner: false,
             isActive: isActive
@@ -218,12 +262,8 @@ app.get('/api/config/banners/list', async (req, res) => {
 });
 
 // --- ROTA 3: API PARA ATUALIZAR CONFIGURAÇÃO (ESCRITA DO PAINEL) ---
-// Manter esta rota quase inalterada. Ela funcionará para:
-// 1. file='daily' (controle global)
-// 2. file='url_do_cloudinary' (controle individual)
 app.put('/api/config/banners', async (req, res) => {
     
-    // Espera { "file": "nome_do_arquivo.png" | "url_do_cloudinary" | "daily", "active": true | false }
     const { file, active } = req.body; 
     
     if (typeof active !== 'boolean' || !file) {
@@ -241,29 +281,18 @@ app.put('/api/config/banners', async (req, res) => {
             newConfig.daily_banners_active = active;
             
         } else {
-            // O "file" aqui é o URL do Cloudinary
             newConfig.specific_banners = newConfig.specific_banners || {};
             
-            // O valor da chave (URL) é o Public ID no caso de um banner ativo.
-            // Para desativar, definimos o valor como 'false'.
             if (active === true) {
-                 // Para ativar, se o banner já estava lá, mantemos o Public ID original
-                 // Ou adicionamos de volta (se já foi excluído, o server.js usará o fallback)
-                 
-                 // Se o valor era 'false' antes, tentamos restaurar o Public ID.
-                 // Como não temos o Public ID aqui, uma maneira simples é deletar a chave
-                 // e fazer um novo upload se for necessário (mais complexo).
-                 // Para este caso, vamos manter a chave no JSON Bin, mas marcar como "ativado"
-                 // reusando o Public ID original que o upload salvou (se existir).
-                 
-                 // Se o banner não existe mais (excluído do Cloudinary), o valor será undefined
+                 // Para reativar (mantém o valor original, que é o Public ID, se ele existir)
                  const originalPublicId = currentConfig.specific_banners[file];
 
-                 if (originalPublicId) {
-                     newConfig.specific_banners[file] = originalPublicId; // Reativa com o ID
+                 if (originalPublicId && originalPublicId !== false) {
+                     newConfig.specific_banners[file] = originalPublicId; 
                  } else {
-                     // Caso ele não tenha sido enviado por upload e sim manualmente
-                     delete newConfig.specific_banners[file];
+                     // Caso a chave tenha sido removida ou o valor não seja válido, apenas a recria como ativa (com o valor 'true')
+                     // Este é um fallback, idealmente o Public ID seria preservado.
+                     newConfig.specific_banners[file] = true;
                  }
                  
             } else {
