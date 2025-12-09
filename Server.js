@@ -1,4 +1,4 @@
-// server.js (CONTROLE INDIVIDUAL POR ARQUIVO DINÂMICO COM CLOUDINARY)
+// server.js (CONTROLE INDIVIDUAL POR ARQUIVO DINÂMICO COM MONGODB)
 
 const express = require('express');
 const cors = require('cors'); 
@@ -46,7 +46,7 @@ async function connectToMongo() {
     if (db) return db; // Retorna conexão existente
     
     if (!uri) {
-        console.error("ERRO: MONGODB_URI não está definida.");
+        console.error("ERRO: MONGODB_URI não está definida. A conexão falhará.");
         return null;
     }
 
@@ -67,10 +67,7 @@ async function connectToMongo() {
 // === FUNÇÕES DE CONFIGURAÇÃO (AGORA MONGODB) ===
 // =========================================================================
 
-// REMOVIDO: As variáveis JSONBIN_URL e JSONBIN_WRITE_URL
-
 async function getBannerConfig() {
-    // A estrutura de retorno continua a mesma: { specific_banners: {...} }
     const defaultFallback = { specific_banners: {} }; 
     const mongoDb = await connectToMongo();
 
@@ -101,7 +98,6 @@ async function getBannerConfig() {
     }
 }
 
-// NOVA FUNÇÃO: Escreve ou atualiza o documento de configuração no MongoDB
 async function updateBannerConfig(newConfig) {
     const mongoDb = await connectToMongo();
 
@@ -112,7 +108,6 @@ async function updateBannerConfig(newConfig) {
     try {
         const collection = mongoDb.collection(collectionName);
         
-        // Usa `updateOne` com `upsert: true` para garantir que o documento exista
         const result = await collection.updateOne(
             { _id: CONFIG_DOCUMENT_ID },
             { $set: newConfig }, 
@@ -165,7 +160,7 @@ app.post('/api/banners/upload', upload.single('bannerFile'), async (req, res) =>
             priority: 999 
         }; 
         
-        // 4. Salva a nova configuração no MONGODB (SUBSTITUI JSONBIN AQUI)
+        // 4. Salva a nova configuração no MONGODB
         await updateBannerConfig(newConfig);
         
         res.json({ 
@@ -183,7 +178,6 @@ app.post('/api/banners/upload', upload.single('bannerFile'), async (req, res) =>
 
 
 // --- ROTA 1: API PARA OBTER OS BANNERS ATIVOS (CONSUMO DO CLIENTE) ---
-// Não alterada, pois usa getBannerConfig()
 app.get('/api/banners', async (req, res) => {
     
     const config = await getBannerConfig();
@@ -228,7 +222,6 @@ app.get('/api/banners', async (req, res) => {
 });
 
 // --- ROTA 2: API PARA OBTER LISTA COMPLETA DE BANNERS E STATUS (PAINEL) ---
-// Não alterada, pois usa getBannerConfig()
 app.get('/api/config/banners/list', async (req, res) => {
     const config = await getBannerConfig(); 
     const specificStatuses = config.specific_banners || {};
@@ -270,8 +263,6 @@ app.put('/api/config/banners', async (req, res) => {
     if (typeof active !== 'boolean' || !file) {
         return res.status(400).json({ success: false, error: 'O campo "active" deve ser booleano e "file" (URL) deve ser fornecido.' });
     }
-
-    // REMOVIDO: As variáveis de URL e API Key do JSON Bin
     
     try {
         const currentConfig = await getBannerConfig();
@@ -298,7 +289,7 @@ app.put('/api/config/banners', async (req, res) => {
             newConfig.specific_banners[file] = false;
         }
 
-        // NOVO: Salva a nova configuração no MONGODB (SUBSTITUI JSONBIN AQUI)
+        // NOVO: Salva a nova configuração no MONGODB
         await updateBannerConfig(newConfig);
 
         // Retorna a nova config para confirmação
