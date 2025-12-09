@@ -1,60 +1,72 @@
-// server.js (CONTROLE INDIVIDUAL POR ARQUIVO DINÂMICO COM CLOUDINARY)
+// server.js (CONTROLE DE BANNER COM CLOUDINARY E MONGODB)
 
 const express = require('express');
 const cors = require('cors'); 
 const { DateTime } = require('luxon');
-const fetch = require('node-fetch'); 
+const fetch = require('node-fetch'); // Mantido por compatibilidade
 const cloudinary = require('cloudinary').v2;
 const multer = require('multer');           
+const { MongoClient } = require('mongodb'); // NOVO: Driver MongoDB
 const app = express();
 
 app.use(express.json()); 
 app.use(cors()); 
 
-// --- CONFIGURAÇÃO CLOUDINARY ---
+// =========================================================================
+// === CONFIGURAÇÃO E CONEXÃO MONGODB ===
+// =========================================================================
+
+// Variáveis de Ambiente Necessárias: MONGODB_URI
+const MONGODB_URI = process.env.MONGODB_URI;
+const DB_NAME = 'banner_db'; // Nome do seu banco de dados
+const COLLECTION_NAME = 'banners'; // Nome da coleção de banners
+
+let db;
+
+async function connectToDatabase() {
+    if (db) {
+        return db; // Retorna a conexão existente se já estiver ativa
+    }
+
+    if (!MONGODB_URI) {
+        throw new Error('A variável de ambiente MONGODB_URI não está configurada.');
+    }
+
+    try {
+        const client = await MongoClient.connect(MONGODB_URI);
+        db = client.db(DB_NAME);
+        console.log('Conectado ao MongoDB com sucesso!');
+        return db;
+    } catch (error) {
+        console.error('Falha ao conectar ao MongoDB:', error.message);
+        throw error;
+    }
+}
+
+async function getBannersCollection() {
+    const database = await connectToDatabase();
+    return database.collection(COLLECTION_NAME);
+}
+
+// =========================================================================
+// === CONFIGURAÇÃO CLOUDINARY ===
+// =========================================================================
 cloudinary.config({
     cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
     api_key: process.env.CLOUDINARY_API_KEY,
     api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
-// Configuração do Multer: Armazena o arquivo na memória temporariamente
+// Configuração do Multer
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
-// =========================================================================
-// === FUNÇÕES DE CONFIGURAÇÃO REMOTA (JSONBIN) ===
-// =========================================================================
-
-const JSONBIN_URL = `https://api.jsonbin.io/v3/b/${process.env.JSONBIN_BIN_ID}/latest`;
-const JSONBIN_WRITE_URL = `https://api.jsonbin.io/v3/b/${process.env.JSONBIN_BIN_ID}`;
-
-async function getBannerConfig() {
-    // MODIFICADO: Estrutura simplificada, sem banners diários
-    const defaultFallback = { specific_banners: {} }; 
-    
-    if (!process.env.JSONBIN_BIN_ID) {
-        return defaultFallback;
-    }
-    
-    try {
-        const response = await fetch(JSONBIN_URL);
-        const data = await response.json();
-        
-        return data.record ? { 
-            specific_banners: data.record.specific_banners || {} 
-        } : defaultFallback; 
-    } catch (error) {
-        console.error('Falha ao buscar estado de banners no JSON Bin:', error.message);
-        return defaultFallback; 
-    }
-}
 
 // =========================================================================
 // === ROTAS DA API ===
 // =========================================================================
 
-// --- ROTA PARA UPLOAD DE BANNER (Cloudinary) ---
+// --- ROTA PARA UPLOAD DE BANNER (Cloudinary + MongoDB) ---
 app.post('/api/banners/upload', upload.single('bannerFile'), async (req, res) => {
     
     if (!req.file) {
@@ -72,33 +84,19 @@ app.post('/api/banners/upload', upload.single('bannerFile'), async (req, res) =>
         const newBannerUrl = result.secure_url;
         const newBannerPublicId = result.public_id; 
 
-        // 2. Busca a configuração atual
-        const currentConfig = await getBannerConfig();
-        const newConfig = { ...currentConfig };
+        // 2. Salva a configuração no MongoDB
+        const collection = await getBannersCollection();
         
-        // 3. Adiciona o novo banner: Padrão é 'random' e PRIORIDADE BAIXA (999)
-        newConfig.specific_banners = newConfig.specific_banners || {};
-        newConfig.specific_banners[newBannerUrl] = {
+        const newBannerDocument = {
+            url: newBannerUrl,
             publicId: newBannerPublicId,
             day: 'random', 
-            priority: 999 // NOVO: Prioridade baixa por padrão (aparecerá por último)
-        }; 
+            priority: 999,
+            isActive: true // Ativado por padrão
+        };
         
-        // 4. Salva a nova configuração no JSON Bin
-        const jsonBinResponse = await fetch(JSONBIN_WRITE_URL, {
-            method: 'PUT',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-Master-Key': process.env.JSONBIN_MASTER_KEY 
-            },
-            body: JSON.stringify(newConfig)
-        });
+        await collection.insertOne(newBannerDocument);
         
-        if (!jsonBinResponse.ok) {
-            const errorBody = await jsonBinResponse.text();
-            throw new Error(`Falha ao atualizar JSON Bin após upload. Status: ${jsonBinResponse.status}. Body: ${errorBody}`);
-        }
-
         res.json({ 
             success: true, 
             message: 'Banner enviado e ativado como Aleatório, com prioridade baixa (999)!', 
@@ -107,12 +105,13 @@ app.post('/api/banners/upload', upload.single('bannerFile'), async (req, res) =>
         });
         
     } catch (error) {
-        console.error('Erro no upload para Cloudinary/JSON Bin:', error);
+        console.error('Erro no upload para Cloudinary/MongoDB:', error);
         res.status(500).json({ success: false, error: `Falha interna ao salvar configuração: ${error.message}` });
     }
 });
 
-// --- ROTA PARA EXCLUSÃO PERMANENTE DE BANNER (Cloudinary + JSON Bin) ---
+
+// --- ROTA PARA EXCLUSÃO PERMANENTE DE BANNER (Cloudinary + MongoDB) ---
 app.delete('/api/banners/delete', async (req, res) => {
     const { fileUrl } = req.body; 
 
@@ -121,48 +120,32 @@ app.delete('/api/banners/delete', async (req, res) => {
     }
     
     try {
-        const currentConfig = await getBannerConfig();
-        const specificStatuses = currentConfig.specific_banners || {};
-        const bannerConfig = specificStatuses[fileUrl];
+        const collection = await getBannersCollection();
+        
+        // 1. Busca o documento para obter o publicId
+        const banner = await collection.findOne({ url: fileUrl });
 
-        if (!bannerConfig) {
-            return res.status(404).json({ success: false, error: 'Banner não encontrado na configuração do JSON Bin.' });
+        if (!banner) {
+            return res.status(404).json({ success: false, error: 'Banner não encontrado no banco de dados.' });
         }
         
-        const publicId = bannerConfig.publicId;
+        const publicId = banner.publicId;
 
-        // 1. Excluir do Cloudinary (usando o publicId)
+        // 2. Excluir do Cloudinary (usando o publicId)
         if (publicId && publicId !== 'unknown') {
             const cloudinaryResult = await cloudinary.uploader.destroy(publicId);
             
             if (cloudinaryResult.result !== 'ok' && cloudinaryResult.result !== 'not found') {
-                // Not found pode ocorrer se o arquivo já foi excluído manualmente.
                 console.warn(`Aviso: Falha ao excluir do Cloudinary: ${cloudinaryResult.result}`);
             }
         }
         
-        // 2. Remover da configuração do JSON Bin
-        const newConfig = { ...currentConfig };
-        delete newConfig.specific_banners[fileUrl]; 
+        // 3. Remover do MongoDB
+        await collection.deleteOne({ url: fileUrl });
         
-        // 3. Salvar a nova configuração no JSON Bin
-        const jsonBinResponse = await fetch(JSONBIN_WRITE_URL, {
-            method: 'PUT',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-Master-Key': process.env.JSONBIN_MASTER_KEY 
-            },
-            body: JSON.stringify(newConfig)
-        });
-        
-        if (!jsonBinResponse.ok) {
-            const errorBody = await jsonBinResponse.text();
-            throw new Error(`Falha ao atualizar JSON Bin após exclusão. Status: ${jsonBinResponse.status}. Body: ${errorBody}`);
-        }
-
         res.json({ 
             success: true, 
-            message: 'Banner excluído com sucesso do Cloudinary e da lista de configuração.'
+            message: 'Banner excluído com sucesso do Cloudinary e do MongoDB.'
         });
 
     } catch (error) {
@@ -175,86 +158,80 @@ app.delete('/api/banners/delete', async (req, res) => {
 // --- ROTA 1: API PARA OBTER OS BANNERS ATIVOS (CONSUMO DO CLIENTE) ---
 app.get('/api/banners', async (req, res) => {
     
-    const config = await getBannerConfig();
-    const specificStatuses = config.specific_banners || {}; 
-    
-    const today = DateTime.local().setZone('America/Sao_Paulo').weekday.toString(); 
-    
-    let activeBanners = [];
+    try {
+        const collection = await getBannersCollection();
+        // Busca todos os banners ativos
+        const allBanners = await collection.find({ isActive: true }).toArray();
+        
+        const today = DateTime.local().setZone('America/Sao_Paulo').weekday.toString(); 
+        
+        let activeBanners = [];
 
-    // 1. Processa Banners Genéricos (Cloudinary)
-    Object.keys(specificStatuses).forEach(url => {
-        const bannerConfig = specificStatuses[url];
-        
-        // Verifica se é um objeto de configuração (formato novo) e se está ativo (não é false)
-        const isActive = bannerConfig && bannerConfig !== false; 
-        
-        if (isActive) {
-            const dayToDisplay = bannerConfig.day || 'random'; 
+        allBanners.forEach(banner => {
+            const dayToDisplay = banner.day || 'random'; 
             
             // Ativo se for 'random' OU o dia configurado for o dia de hoje
             if (dayToDisplay === 'random' || dayToDisplay === today) {
                 activeBanners.push({
-                    url: url,
-                    priority: bannerConfig.priority || 999 // Usa prioridade salva ou 999
+                    url: banner.url,
+                    priority: banner.priority || 999 
                 });
             }
-        }
-    });
-    
-    // 2. NOVO: Ordena a lista de banners ativos pela prioridade (menor número = maior prioridade)
-    activeBanners.sort((a, b) => a.priority - b.priority);
+        });
+        
+        // Ordena a lista de banners ativos pela prioridade (menor número = maior prioridade)
+        activeBanners.sort((a, b) => a.priority - b.priority);
 
-    // 3. Extrai apenas os URLs para a resposta final
-    const finalBannerUrls = activeBanners.map(b => b.url);
-    
-    res.json({ 
-        banners: [...new Set(finalBannerUrls)],
-        debug: {
-            currentDay: today,
-            timezone: 'America/Sao_Paulo',
-            numGenericosAtivos: finalBannerUrls.length 
-        }
-    });
+        // Extrai apenas os URLs para a resposta final
+        const finalBannerUrls = activeBanners.map(b => b.url);
+        
+        res.json({ 
+            banners: [...new Set(finalBannerUrls)],
+            debug: {
+                currentDay: today,
+                timezone: 'America/Sao_Paulo',
+                numGenericosAtivos: finalBannerUrls.length 
+            }
+        });
+
+    } catch (error) {
+        console.error('Erro ao buscar banners ativos:', error);
+        res.status(500).json({ success: false, error: `Falha interna ao buscar banners: ${error.message}` });
+    }
 });
 
 // --- ROTA 2: API PARA OBTER LISTA COMPLETA DE BANNERS E STATUS (PAINEL) ---
 app.get('/api/config/banners/list', async (req, res) => {
-    const config = await getBannerConfig(); 
-    const specificStatuses = config.specific_banners || {};
     
-    let bannerList = [];
-
-    // 1. Adiciona Banners Genéricos (lidos do JSON Bin/Cloudinary)
-    Object.keys(specificStatuses).forEach(url => {
-        const bannerConfig = specificStatuses[url];
+    try {
+        const collection = await getBannersCollection();
+        // Busca todos os banners
+        const allBanners = await collection.find({}).toArray();
         
-        const isActive = bannerConfig && bannerConfig !== false; 
-        
-        const day = isActive ? (bannerConfig.day || 'random') : 'random'; 
-        // NOVO: Adiciona o campo priority
-        const priority = isActive ? (bannerConfig.priority || 999) : 999; 
-        
-        bannerList.push({
-            fileName: url, 
+        let bannerList = allBanners.map(banner => ({
+            fileName: banner.url, 
             isDailyBanner: false, 
-            isActive: isActive,
-            day: day, 
-            priority: priority // NOVO: Campo de Prioridade
-        });
-    });
-    
-    // NOVO: Ordena a lista para exibição no painel pela prioridade (1º a 999º)
-    bannerList.sort((a, b) => a.priority - b.priority);
+            isActive: banner.isActive,
+            day: banner.day || 'random', 
+            priority: banner.priority || 999 
+        }));
+        
+        // Ordena a lista para exibição no painel pela prioridade
+        bannerList.sort((a, b) => a.priority - b.priority);
 
-    res.json({
-        config: {}, // Sem daily_banners_active
-        banners: bannerList
-    });
+        res.json({
+            config: {}, 
+            banners: bannerList
+        });
+
+    } catch (error) {
+        console.error('Erro ao listar banners:', error);
+        res.status(500).json({ success: false, error: `Falha interna ao listar banners: ${error.message}` });
+    }
 });
 
 // --- ROTA 3: API PARA ATUALIZAR CONFIGURAÇÃO (ESCRITA DO PAINEL) ---
-// Agora lida com 'active', 'day' e 'priority'
+// Agora lida com 'active', 'day' e 'priority' no MongoDB
 app.put('/api/config/banners', async (req, res) => {
     
     const { file, active, day, priority } = req.body; 
@@ -262,66 +239,48 @@ app.put('/api/config/banners', async (req, res) => {
     if (typeof active !== 'boolean' || !file) {
         return res.status(400).json({ success: false, error: 'O campo "active" deve ser booleano e "file" (URL) deve ser fornecido.' });
     }
-
-    const url = JSONBIN_WRITE_URL; 
-    const apiKey = process.env.JSONBIN_MASTER_KEY; 
     
     try {
-        const currentConfig = await getBannerConfig();
-        const newConfig = { ...currentConfig };
+        const collection = await getBannersCollection();
         
-        newConfig.specific_banners = newConfig.specific_banners || {};
-            
-        const currentBannerConfig = currentConfig.specific_banners[file];
+        // Dados a serem atualizados (update object)
+        const updateData = {
+            isActive: active,
+            // Só atualiza day e priority se for passado OU se o banner estiver ativo
+            day: day || 'random', 
+            priority: priority !== undefined ? priority : 999
+        };
         
-        // Se a configuração atual for 'false' (desativado no formato antigo), tratamos como objeto vazio
-        const baseConfig = currentBannerConfig && currentBannerConfig !== false ? currentBannerConfig : {};
-
-        if (active === true) {
-            
-            const publicId = baseConfig.publicId || 'unknown'; 
-            
-            newConfig.specific_banners[file] = {
-                publicId: publicId,
-                // NOVO: Prioriza o valor de 'day' enviado, senão o existente, senão 'random'
-                day: day || baseConfig.day || 'random', 
-                // NOVO: Prioriza o valor de 'priority' enviado, senão o existente, senão 999
-                priority: priority !== undefined ? priority : (baseConfig.priority || 999) 
-            };
-            
-        } else {
-            // DESATIVAR: Define explicitamente a chave (URL) como 'false'
-            newConfig.specific_banners[file] = false;
+        // Se estiver desativando, garantimos que day e priority refletem o que já estava lá (para não perder a config)
+        if (!active) {
+            const currentBanner = await collection.findOne({ url: file });
+            if (currentBanner) {
+                updateData.day = currentBanner.day || 'random';
+                updateData.priority = currentBanner.priority || 999;
+            }
         }
+        
+        const result = await collection.updateOne(
+            { url: file }, // Filtro: usa a URL como identificador único
+            { $set: updateData }, 
+            { upsert: false } // Não cria se não existir (upsert false)
+        );
 
-
-        const response = await fetch(url, {
-            method: 'PUT',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-Master-Key': process.env.JSONBIN_MASTER_KEY 
-            },
-            body: JSON.stringify(newConfig) 
-        });
-
-        if (!response.ok) {
-            const errorBody = await response.text();
-            throw new Error(`Falha ao atualizar JSON Bin. Status: ${response.status}. Body: ${errorBody}`);
+        if (result.matchedCount === 0) {
+            return res.status(404).json({ success: false, error: 'Banner não encontrado para atualização.' });
         }
-
-        // Retorna a nova config para confirmação
-        const updatedConfig = newConfig.specific_banners[file] === false ? { day: baseConfig.day || 'random', priority: baseConfig.priority || 999 } : newConfig.specific_banners[file];
 
         res.json({ 
             success: true, 
-            new_state: active, 
+            new_state: updateData.isActive, 
             banner_file: file, 
-            new_day: updatedConfig.day,
-            new_priority: updatedConfig.priority,
-            message: `Configuração do banner ${file} atualizada com sucesso.` 
+            new_day: updateData.day,
+            new_priority: updateData.priority,
+            message: `Configuração do banner ${file} atualizada com sucesso no MongoDB.` 
         });
+        
     } catch (error) {
-        console.error('Erro de escrita no JSON Bin:', error);
+        console.error('Erro de escrita no MongoDB:', error);
         res.status(500).json({ success: false, error: `Falha interna ao salvar configuração: ${error.message}` });
     }
 });
