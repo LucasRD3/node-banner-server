@@ -42,6 +42,7 @@ const JSONBIN_URL = `https://api.jsonbin.io/v3/b/${process.env.JSONBIN_BIN_ID}/l
 const JSONBIN_WRITE_URL = `https://api.jsonbin.io/v3/b/${process.env.JSONBIN_BIN_ID}`;
 
 async function getBannerConfig() {
+    // ALTERAÇÃO: specific_banners agora mapeará URLs para { publicId: string | false, day: string }
     const defaultFallback = { specific_banners: {}, daily_banners_active: true };
     
     if (!process.env.JSONBIN_BIN_ID) {
@@ -59,11 +60,29 @@ async function getBannerConfig() {
     }
 }
 
+// NOVO: Função auxiliar para salvar a configuração no JSON Bin
+async function saveBannerConfig(newConfig) {
+    const jsonBinResponse = await fetch(JSONBIN_WRITE_URL, {
+        method: 'PUT',
+        headers: {
+            'Content-Type': 'application/json',
+            'X-Master-Key': process.env.JSONBIN_MASTER_KEY 
+        },
+        body: JSON.stringify(newConfig)
+    });
+    
+    if (!jsonBinResponse.ok) {
+        const errorBody = await jsonBinResponse.text();
+        throw new Error(`Falha ao atualizar JSON Bin. Status: ${jsonBinResponse.status}. Body: ${errorBody}`);
+    }
+    return true;
+}
+
 // =========================================================================
 // === ROTAS DA API ===
 // =========================================================================
 
-// --- NOVO: ROTA PARA UPLOAD DE BANNER (Cloudinary) ---
+// --- ROTA PARA UPLOAD DE BANNER (Cloudinary) ---
 app.post('/api/banners/upload', upload.single('bannerFile'), async (req, res) => {
     
     if (!req.file) {
@@ -85,24 +104,16 @@ app.post('/api/banners/upload', upload.single('bannerFile'), async (req, res) =>
         const currentConfig = await getBannerConfig();
         const newConfig = { ...currentConfig };
         
-        // 3. Adiciona o novo banner (URL) como chave no JSON Bin, mapeando para o Public ID
+        // 3. Adiciona o novo banner (URL) como chave no JSON Bin
+        // ALTERAÇÃO: Armazena um objeto com publicId e o dia padrão 'random'
         newConfig.specific_banners = newConfig.specific_banners || {};
-        newConfig.specific_banners[newBannerUrl] = newBannerPublicId; 
+        newConfig.specific_banners[newBannerUrl] = { 
+            publicId: newBannerPublicId, 
+            day: 'random' // Novo valor padrão
+        }; 
         
         // 4. Salva a nova configuração no JSON Bin
-        const jsonBinResponse = await fetch(JSONBIN_WRITE_URL, {
-            method: 'PUT',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-Master-Key': process.env.JSONBIN_MASTER_KEY 
-            },
-            body: JSON.stringify(newConfig)
-        });
-        
-        if (!jsonBinResponse.ok) {
-            const errorBody = await jsonBinResponse.text();
-            throw new Error(`Falha ao atualizar JSON Bin após upload. Status: ${jsonBinResponse.status}. Body: ${errorBody}`);
-        }
+        await saveBannerConfig(newConfig);
 
         res.json({ 
             success: true, 
@@ -118,7 +129,7 @@ app.post('/api/banners/upload', upload.single('bannerFile'), async (req, res) =>
 });
 
 
-// --- NOVO: ROTA PARA EXCLUIR BANNER PERMANENTEMENTE ---
+// --- ROTA PARA EXCLUIR BANNER PERMANENTEMENTE ---
 app.delete('/api/banners/delete', async (req, res) => {
     // Espera { "fileUrl": "url_completa_do_cloudinary" } no corpo da requisição DELETE
     const { fileUrl } = req.body;
@@ -132,10 +143,18 @@ app.delete('/api/banners/delete', async (req, res) => {
         const currentConfig = await getBannerConfig();
         const specificBanners = currentConfig.specific_banners || {};
         
-        // A URL é a chave; o valor é o Public ID (ou false se desativado)
-        const publicId = specificBanners[fileUrl]; 
-
-        if (!publicId && publicId !== false) {
+        // A chave (URL) é o bannerInfo (objeto ou valor antigo)
+        const bannerInfo = specificBanners[fileUrl]; 
+        
+        // ALTERAÇÃO: Extrai publicId do novo objeto ou usa o valor antigo
+        let publicId = null;
+        if (typeof bannerInfo === 'object' && bannerInfo !== null) {
+            publicId = bannerInfo.publicId;
+        } else {
+            publicId = bannerInfo; // Caso seja a estrutura antiga (Public ID string ou false)
+        }
+        
+        if (!bannerInfo && bannerInfo !== false) {
              return res.status(404).json({ success: false, error: 'Banner não encontrado na configuração do JSON Bin.' });
         }
         
@@ -150,19 +169,7 @@ app.delete('/api/banners/delete', async (req, res) => {
         delete newConfig.specific_banners[fileUrl];
         
         // 4. Salvar a nova configuração no JSON Bin
-        const jsonBinResponse = await fetch(JSONBIN_WRITE_URL, {
-            method: 'PUT',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-Master-Key': process.env.JSONBIN_MASTER_KEY
-            },
-            body: JSON.stringify(newConfig)
-        });
-        
-        if (!jsonBinResponse.ok) {
-            const errorBody = await jsonBinResponse.text();
-            throw new Error(`Falha ao atualizar JSON Bin após exclusão. Status: ${jsonBinResponse.status}. Body: ${errorBody}`);
-        }
+        await saveBannerConfig(newConfig);
 
         res.json({ 
             success: true, 
@@ -199,10 +206,25 @@ app.get('/api/banners', async (req, res) => {
 
     // 2. Processa Banners Genéricos e Aleatórios (Lendo URLs do JSON Bin/Cloudinary)
     Object.keys(specificStatuses).forEach(url => {
-        // A chave (URL) é considerada ativa se o valor não for explicitamente 'false'
-        const isActive = specificStatuses[url] !== false; 
+        const bannerInfo = specificStatuses[url]; 
         
-        if (isActive) {
+        // ALTERAÇÃO: Lógica para tratar a nova estrutura e a estrutura antiga (Public ID ou false)
+        let isActive = false;
+        let dayToDisplay = 'random'; // Novo campo
+
+        if (typeof bannerInfo === 'object' && bannerInfo !== null) {
+             // Nova Estrutura: { publicId: string | boolean, day: string }
+             isActive = typeof bannerInfo.publicId === 'string'; // Ativo se publicId for string
+             dayToDisplay = bannerInfo.day || 'random';
+        } else {
+             // Estrutura Antiga (Compatibilidade): 'publicId' ou 'false'
+             isActive = typeof bannerInfo === 'string'; // Ativo se for uma string (Public ID)
+        }
+
+        // ALTERAÇÃO: Verifica se o banner deve ser exibido hoje (dia ou 'random')
+        const isToday = dayToDisplay === 'random' || dayToDisplay === String(today);
+        
+        if (isActive && isToday) {
             finalBannerUrls.push(url);
         }
     });
@@ -244,12 +266,26 @@ app.get('/api/config/banners/list', async (req, res) => {
     
     // 2. Adiciona Banners Genéricos (lidos do JSON Bin/Cloudinary)
     Object.keys(specificStatuses).forEach(url => {
-        const isActive = specificStatuses[url] !== false; 
+        const bannerInfo = specificStatuses[url];
+        
+        // ALTERAÇÃO: Lógica para extrair status e dia
+        let isActive = false;
+        let day = 'random';
+        
+        if (typeof bannerInfo === 'object' && bannerInfo !== null) {
+            // Nova Estrutura
+            isActive = typeof bannerInfo.publicId === 'string';
+            day = bannerInfo.day || 'random';
+        } else {
+            // Estrutura Antiga (Compatibilidade)
+            isActive = typeof bannerInfo === 'string'; // Ativo se for uma string (Public ID)
+        }
         
         bannerList.push({
             fileName: url, 
             isDailyBanner: false,
-            isActive: isActive
+            isActive: isActive,
+            day: day, // NOVO CAMPO
         });
     });
 
@@ -264,14 +300,12 @@ app.get('/api/config/banners/list', async (req, res) => {
 // --- ROTA 3: API PARA ATUALIZAR CONFIGURAÇÃO (ESCRITA DO PAINEL) ---
 app.put('/api/config/banners', async (req, res) => {
     
-    const { file, active } = req.body; 
+    // ALTERAÇÃO: Adiciona 'day' no corpo da requisição (opcional, só para banners Cloudinary)
+    const { file, active, day } = req.body; 
     
     if (typeof active !== 'boolean' || !file) {
         return res.status(400).json({ success: false, error: 'O campo "active" deve ser booleano e "file" deve ser fornecido.' });
     }
-
-    const url = JSONBIN_WRITE_URL; 
-    const apiKey = process.env.JSONBIN_MASTER_KEY; 
     
     try {
         const currentConfig = await getBannerConfig();
@@ -283,39 +317,51 @@ app.put('/api/config/banners', async (req, res) => {
         } else {
             newConfig.specific_banners = newConfig.specific_banners || {};
             
+            // 1. Lógica para obter o status atual (Pode ser string, false ou objeto)
+            const currentBannerValue = newConfig.specific_banners[file];
+            
+            if (!currentBannerValue && currentBannerValue !== false) {
+                return res.status(404).json({ success: false, error: `Banner ${file} não encontrado na configuração.` });
+            }
+            
+            // Variáveis temporárias para a nova estrutura
+            let publicIdToSave = null;
+            let currentDay = 'random';
+            
+            // 2. Determina os valores atuais e trata a compatibilidade
+            if (typeof currentBannerValue === 'object' && currentBannerValue !== null) {
+                // Nova Estrutura
+                publicIdToSave = currentBannerValue.publicId;
+                currentDay = currentBannerValue.day || 'random';
+            } else {
+                // Estrutura Antiga (Public ID string ou false)
+                publicIdToSave = currentBannerValue;
+            }
+            
+            // 3. Lógica de Ativação/Desativação (muda o publicId para string ou false)
             if (active === true) {
-                 // Para reativar (mantém o valor original, que é o Public ID, se ele existir)
-                 const originalPublicId = currentConfig.specific_banners[file];
-
-                 if (originalPublicId && originalPublicId !== false) {
-                     newConfig.specific_banners[file] = originalPublicId; 
-                 } else {
-                     // Caso a chave tenha sido removida ou o valor não seja válido, apenas a recria como ativa (com o valor 'true')
-                     // Este é um fallback, idealmente o Public ID seria preservado.
-                     newConfig.specific_banners[file] = true;
-                 }
+                 // Para reativar: publicId deve ser a string original
+                 publicIdToSave = typeof publicIdToSave === 'string' ? publicIdToSave : file; 
                  
             } else {
-                 // Para desativar, define explicitamente a chave (URL) como 'false'
-                 newConfig.specific_banners[file] = false;
+                 // Para desativar: publicId deve ser 'false'
+                 publicIdToSave = false;
             }
+
+            // 4. Lógica de Mudar o Dia (se 'day' foi fornecido, usa o novo valor; senão, preserva o antigo)
+            const dayToSave = day !== undefined ? day : currentDay; 
+
+            // 5. Salva o novo objeto
+            newConfig.specific_banners[file] = {
+                publicId: publicIdToSave,
+                day: dayToSave
+            };
         }
 
-        const response = await fetch(url, {
-            method: 'PUT',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-Master-Key': apiKey 
-            },
-            body: JSON.stringify(newConfig) 
-        });
+        // Salva a nova configuração no JSON Bin
+        await saveBannerConfig(newConfig);
 
-        if (!response.ok) {
-            const errorBody = await response.text();
-            throw new Error(`Falha ao atualizar JSON Bin. Status: ${response.status}. Body: ${errorBody}`);
-        }
-
-        res.json({ success: true, new_state: active, banner_file: file, message: `Estado do banner ${file} atualizado com sucesso.` });
+        res.json({ success: true, new_state: active, new_day: newConfig.specific_banners[file]?.day || undefined, banner_file: file, message: `Estado e/ou dia do banner ${file} atualizado com sucesso.` });
     } catch (error) {
         console.error('Erro de escrita no JSON Bin:', error);
         res.status(500).json({ success: false, error: `Falha interna ao salvar configuração: ${error.message}` });
