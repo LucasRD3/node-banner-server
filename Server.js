@@ -1,17 +1,18 @@
-// server.js (ATUALIZADO COM CHAVE DE ATIVAÇÃO)
+// server.js (ATUALIZADO COM JSONBIN PARA DASHBOARD)
 
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
 const cors = require('cors'); 
-const { DateTime } = require('luxon'); // ✅ Importa Luxon
+const { DateTime } = require('luxon');
+const fetch = require('node-fetch'); // ✅ NOVO: Importa node-fetch
 const app = express();
 
-// --- Configuração CORS ---
+// --- Middleware para leitura de JSON (Necessário para a rota PUT) ---
+app.use(express.json()); 
 app.use(cors()); 
 
 // --- 1. CONFIGURAÇÃO DA PASTA DE ARQUIVOS ESTÁTICOS ---
-// A pasta 'banners' está no mesmo nível do 'server.js'.
 app.use(express.static(path.join(__dirname, 'banners'))); 
 
 // =========================================================================
@@ -19,42 +20,65 @@ app.use(express.static(path.join(__dirname, 'banners')));
 // =========================================================================
 
 const BannerDoDia = {
-    7: 'banner_domingo.png',  // Domingo (Day 7 em Luxon)
-    1: 'banner_segunda.png',  // Segunda-feira (Day 1 em Luxon)
-    2: 'banner_terca.png',    // Terça-feira (Day 2 em Luxon)
-    3: 'banner_quarta.png',   // Quarta-feira (Day 3 em Luxon)
-    4: 'banner_quinta.png',   // Quinta-feira (Day 4 em Luxon)
-    5: 'banner_sexta.png',    // Sexta-feira (Day 5 em Luxon)
-    6: 'banner_sabado.png'    // Sábado (Day 6 em Luxon)
+    7: 'banner_domingo.png',  
+    1: 'banner_segunda.png',  
+    2: 'banner_terca.png',    
+    3: 'banner_quarta.png',   
+    4: 'banner_quinta.png',   
+    5: 'banner_sexta.png',    
+    6: 'banner_sabado.png'    
 };
 
+// =========================================================================
+// === FUNÇÕES DE CONFIGURAÇÃO REMOTA (JSONBIN) ===
+// =========================================================================
 
-// --- 2. ROTA API PARA OBTER OS BANNERS ---
-app.get('/api/banners', (req, res) => {
-    const bannersDir = path.join(__dirname, 'banners');
+const JSONBIN_URL = `https://api.jsonbin.io/v3/b/${process.env.JSONBIN_BIN_ID}/latest`;
+const JSONBIN_WRITE_URL = `https://api.jsonbin.io/v3/b/${process.env.JSONBIN_BIN_ID}`;
+
+// Função para buscar o estado de ativação no JSON Bin
+async function isBannersActive() {
+    try {
+        const response = await fetch(JSONBIN_URL);
+        const data = await response.json();
+        
+        // Retorna 'true' ou 'false' com base no campo 'active'
+        // Se a busca falhar ou o campo não existir, assume 'true' (ativo) como fallback seguro
+        return data.record ? data.record.active === true : true; 
+    } catch (error) {
+        console.error('Falha ao buscar estado de ativação no JSON Bin, assumindo ATIVO:', error);
+        return true; 
+    }
+}
+
+// --- ROTA 1: API PARA OBTER OS BANNERS (Rota de LEITURA) ---
+// Transformada em async para poder usar 'await isBannersActive()'
+app.get('/api/banners', async (req, res) => {
     
-    // Obtém o dia atual e o banner esperado para manter o debug útil
-    const today = DateTime.local().setZone('America/Sao_Paulo').weekday; // 1 (Seg) a 7 (Dom)
+    // 🛑 PASSO 3A: CHECAGEM DO ESTADO LIDO NO JSON BIN
+    const isActive = await isBannersActive();
+    
+    // Configurações de Debug (úteis mesmo se desativado)
+    const today = DateTime.local().setZone('America/Sao_Paulo').weekday; 
     const bannerFilenameToday = BannerDoDia[today]; 
+    const debugMessage = isActive ? 
+                         (bannerFilenameToday || 'Nenhum') : 
+                         'DESATIVADO por JSON Bin';
 
-    // =======================================================
-    // 🛑 PASSO 1A: CHECAGEM DA VARIÁVEL DE AMBIENTE PARA DESATIVAÇÃO
-    // Se BANNERS_ACTIVE for estritamente a string 'false', desativa os banners.
-    const isBannersActive = process.env.BANNERS_ACTIVE !== 'false';
-    
-    if (!isBannersActive) {
-        // Retorna um JSON vazio e uma mensagem de debug
+    if (!isActive) {
+        // Retorno rápido se desativado
         return res.json({ 
             banners: [],
             debug: {
                 currentDay: today,
                 timezone: 'America/Sao_Paulo',
-                expectedBanner: 'DESATIVADO por BANNERS_ACTIVE=false' 
+                expectedBanner: debugMessage
             }
         });
     }
-    // =======================================================
 
+    // --- Lógica de Banners existente (só é executada se 'isActive' for true) ---
+    const bannersDir = path.join(__dirname, 'banners');
     const allDailyBanners = Object.values(BannerDoDia); 
     const baseUrl = req.protocol + '://' + req.get('host');
 
@@ -67,18 +91,12 @@ app.get('/api/banners', (req, res) => {
         let dailyBannerUrl = [];
         const genericBannerUrls = [];
 
-        // 1. Filtra apenas arquivos de imagem válidos
-        const imageFiles = files.filter(file => 
-            /\.(jpe?g|png|gif|webp)$/i.test(file)
-        );
+        const imageFiles = files.filter(file => /\.(jpe?g|png|gif|webp)$/i.test(file));
 
-        // 2. Classifica os arquivos
         imageFiles.forEach(file => {
-            // A. É o banner que deve ser exibido hoje?
             if (file === bannerFilenameToday) {
                 dailyBannerUrl.push(`${baseUrl}/${file}`);
             } 
-            // B. Não é um banner mapeado para NENHUM dia da semana?
             else if (!allDailyBanners.includes(file)) {
                 genericBannerUrls.push(`${baseUrl}/${file}`);
             }
@@ -86,19 +104,55 @@ app.get('/api/banners', (req, res) => {
 
         const finalBannerUrls = [...dailyBannerUrl, ...genericBannerUrls];
 
-        if (finalBannerUrls.length === 0) {
-            console.log("Nenhum banner encontrado ou mapeado para hoje.");
-        }
-
         res.json({ 
             banners: finalBannerUrls,
             debug: {
                 currentDay: today,
                 timezone: 'America/Sao_Paulo',
-                expectedBanner: bannerFilenameToday || 'Nenhum'
+                expectedBanner: debugMessage
             }
         });
     });
 });
 
+// --- ROTA 2: API PARA ATUALIZAR CONFIGURAÇÃO (Rota de ESCRITA) ---
+app.put('/api/config/banners', async (req, res) => {
+    
+    // Espera { "active": true | false } no corpo da requisição do Dashboard
+    const { active } = req.body; 
+    
+    if (typeof active !== 'boolean') {
+        return res.status(400).json({ success: false, error: 'O campo "active" deve ser booleano.' });
+    }
+
+    // URL de Escrita (sem o /latest)
+    const url = JSONBIN_WRITE_URL; 
+    const apiKey = process.env.JSONBIN_MASTER_KEY; 
+    
+    try {
+        const response = await fetch(url, {
+            method: 'PUT',
+            headers: {
+                'Content-Type': 'application/json',
+                // A Master Key é obrigatória para escrita/PUT/criação
+                'X-Master-Key': apiKey 
+            },
+            body: JSON.stringify({ active }) // Envia o novo estado
+        });
+
+        if (!response.ok) {
+            // Se a API do JSON Bin retornar erro (ex: chave errada)
+            const errorBody = await response.text();
+            console.error('Falha na resposta do JSON Bin:', response.status, errorBody);
+            throw new Error(`Falha ao atualizar JSON Bin. Status: ${response.status}`);
+        }
+
+        res.json({ success: true, new_state: active, message: 'Estado atualizado com sucesso.' });
+    } catch (error) {
+        console.error('Erro de escrita no JSON Bin:', error);
+        res.status(500).json({ success: false, error: 'Falha interna ao salvar configuração.' });
+    }
+});
+
+// --- EXPORTAÇÃO VERCEL: Exporta o aplicativo Express. ---
 module.exports = app;
