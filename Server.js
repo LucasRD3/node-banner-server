@@ -1,8 +1,6 @@
 // server.js (CONTROLE INDIVIDUAL POR ARQUIVO DINÂMICO COM CLOUDINARY)
 
 const express = require('express');
-// const path = require('path'); // REMOVIDO: Não mais necessário para ler arquivos locais
-// const fs = require('fs');     // REMOVIDO: Não mais necessário para ler arquivos locais
 const cors = require('cors'); 
 const { DateTime } = require('luxon');
 const fetch = require('node-fetch'); 
@@ -32,7 +30,7 @@ const JSONBIN_URL = `https://api.jsonbin.io/v3/b/${process.env.JSONBIN_BIN_ID}/l
 const JSONBIN_WRITE_URL = `https://api.jsonbin.io/v3/b/${process.env.JSONBIN_BIN_ID}`;
 
 async function getBannerConfig() {
-    // MODIFICADO: O fallback deve refletir a nova estrutura (apenas specific_banners e seus dias)
+    // MODIFICADO: Estrutura simplificada, sem banners diários
     const defaultFallback = { specific_banners: {} }; 
     
     if (!process.env.JSONBIN_BIN_ID) {
@@ -43,24 +41,20 @@ async function getBannerConfig() {
         const response = await fetch(JSONBIN_URL);
         const data = await response.json();
         
-        // Assegura que o retorno sempre tenha a estrutura esperada e não a flag daily_banners_active
         return data.record ? { 
             specific_banners: data.record.specific_banners || {} 
         } : defaultFallback; 
     } catch (error) {
-        console.error('Falha ao buscar estado de banners no JSON Bin, assumindo ATIVO:', error.message);
+        console.error('Falha ao buscar estado de banners no JSON Bin:', error.message);
         return defaultFallback; 
     }
 }
-
-// Funções para manipulação da configuração no JSON Bin
-// ... (upload e outros métodos que usam getBannerConfig)
 
 // =========================================================================
 // === ROTAS DA API ===
 // =========================================================================
 
-// --- NOVO: ROTA PARA UPLOAD DE BANNER (Cloudinary) ---
+// --- ROTA PARA UPLOAD DE BANNER (Cloudinary) ---
 app.post('/api/banners/upload', upload.single('bannerFile'), async (req, res) => {
     
     if (!req.file) {
@@ -82,12 +76,12 @@ app.post('/api/banners/upload', upload.single('bannerFile'), async (req, res) =>
         const currentConfig = await getBannerConfig();
         const newConfig = { ...currentConfig };
         
-        // 3. Adiciona o novo banner (URL) como chave no JSON Bin, mapeando para um objeto de status/dia
+        // 3. Adiciona o novo banner: Padrão é 'random' e PRIORIDADE BAIXA (999)
         newConfig.specific_banners = newConfig.specific_banners || {};
-        // NOVO: Adiciona o banner com status 'ativo' e dia 'random' por padrão
         newConfig.specific_banners[newBannerUrl] = {
             publicId: newBannerPublicId,
-            day: 'random' // Novo banner é 'random' por padrão
+            day: 'random', 
+            priority: 999 // NOVO: Prioridade baixa por padrão (aparecerá por último)
         }; 
         
         // 4. Salva a nova configuração no JSON Bin
@@ -107,7 +101,7 @@ app.post('/api/banners/upload', upload.single('bannerFile'), async (req, res) =>
 
         res.json({ 
             success: true, 
-            message: 'Banner enviado e ativado como Aleatório!', // Mensagem atualizada
+            message: 'Banner enviado e ativado como Aleatório, com prioridade baixa (999)!', 
             url: newBannerUrl,
             publicId: newBannerPublicId
         });
@@ -125,8 +119,9 @@ app.get('/api/banners', async (req, res) => {
     const config = await getBannerConfig();
     const specificStatuses = config.specific_banners || {}; 
     
-    const today = DateTime.local().setZone('America/Sao_Paulo').weekday.toString(); // Dia da semana (1 a 7, como string)
-    let finalBannerUrls = [];
+    const today = DateTime.local().setZone('America/Sao_Paulo').weekday.toString(); 
+    
+    let activeBanners = [];
 
     // 1. Processa Banners Genéricos (Cloudinary)
     Object.keys(specificStatuses).forEach(url => {
@@ -136,21 +131,23 @@ app.get('/api/banners', async (req, res) => {
         const isActive = bannerConfig && bannerConfig !== false; 
         
         if (isActive) {
-            // Verifica o dia de exibição
-            const dayToDisplay = bannerConfig.day || 'random'; // Padrão: 'random'
+            const dayToDisplay = bannerConfig.day || 'random'; 
             
             // Ativo se for 'random' OU o dia configurado for o dia de hoje
             if (dayToDisplay === 'random' || dayToDisplay === today) {
-                finalBannerUrls.push(url);
+                activeBanners.push({
+                    url: url,
+                    priority: bannerConfig.priority || 999 // Usa prioridade salva ou 999
+                });
             }
         }
     });
     
-    // Embaralha a lista (opcional, mas recomendado para banners 'random')
-    // for (let i = finalBannerUrls.length - 1; i > 0; i--) {
-    //     const j = Math.floor(Math.random() * (i + 1));
-    //     [finalBannerUrls[i], finalBannerUrls[j]] = [finalBannerUrls[j], finalBannerUrls[i]];
-    // }
+    // 2. NOVO: Ordena a lista de banners ativos pela prioridade (menor número = maior prioridade)
+    activeBanners.sort((a, b) => a.priority - b.priority);
+
+    // 3. Extrai apenas os URLs para a resposta final
+    const finalBannerUrls = activeBanners.map(b => b.url);
     
     res.json({ 
         banners: [...new Set(finalBannerUrls)],
@@ -164,45 +161,44 @@ app.get('/api/banners', async (req, res) => {
 
 // --- ROTA 2: API PARA OBTER LISTA COMPLETA DE BANNERS E STATUS (PAINEL) ---
 app.get('/api/config/banners/list', async (req, res) => {
-    // REMOVIDO: leitura de disco e banners diários
     const config = await getBannerConfig(); 
     const specificStatuses = config.specific_banners || {};
     
     let bannerList = [];
 
     // 1. Adiciona Banners Genéricos (lidos do JSON Bin/Cloudinary)
-    // As chaves são os URLs completos do Cloudinary.
     Object.keys(specificStatuses).forEach(url => {
         const bannerConfig = specificStatuses[url];
         
-        // Verifica se o valor é um objeto (novo formato) ou false (antigo desativado)
         const isActive = bannerConfig && bannerConfig !== false; 
         
-        // O dia é 'random' se não estiver definido
         const day = isActive ? (bannerConfig.day || 'random') : 'random'; 
+        // NOVO: Adiciona o campo priority
+        const priority = isActive ? (bannerConfig.priority || 999) : 999; 
         
         bannerList.push({
             fileName: url, 
-            isDailyBanner: false, // Sempre false agora
+            isDailyBanner: false, 
             isActive: isActive,
-            day: day // Novo campo 'day'
+            day: day, 
+            priority: priority // NOVO: Campo de Prioridade
         });
     });
+    
+    // NOVO: Ordena a lista para exibição no painel pela prioridade (1º a 999º)
+    bannerList.sort((a, b) => a.priority - b.priority);
 
     res.json({
-        config: {
-            // REMOVIDO: daily_banners_active
-        },
+        config: {}, // Sem daily_banners_active
         banners: bannerList
     });
 });
 
 // --- ROTA 3: API PARA ATUALIZAR CONFIGURAÇÃO (ESCRITA DO PAINEL) ---
-// Agora lida com 'active' e 'day'
+// Agora lida com 'active', 'day' e 'priority'
 app.put('/api/config/banners', async (req, res) => {
     
-    // Espera { "file": "url_do_cloudinary", "active": true | false, "day": "1" | "random" | ... }
-    const { file, active, day } = req.body; 
+    const { file, active, day, priority } = req.body; 
     
     if (typeof active !== 'boolean' || !file) {
         return res.status(400).json({ success: false, error: 'O campo "active" deve ser booleano e "file" (URL) deve ser fornecido.' });
@@ -215,22 +211,23 @@ app.put('/api/config/banners', async (req, res) => {
         const currentConfig = await getBannerConfig();
         const newConfig = { ...currentConfig };
         
-        // O "file" aqui é o URL do Cloudinary
         newConfig.specific_banners = newConfig.specific_banners || {};
             
-        // Pega a configuração atual para preservar o publicId
         const currentBannerConfig = currentConfig.specific_banners[file];
         
+        // Se a configuração atual for 'false' (desativado no formato antigo), tratamos como objeto vazio
+        const baseConfig = currentBannerConfig && currentBannerConfig !== false ? currentBannerConfig : {};
+
         if (active === true) {
-            // ATIVAR: Preserva o publicId e define o dia (se fornecido)
             
-            // O publicId deve vir da config atual (se o banner já existia) ou ser 'uploaded' (se o upload acabou de ocorrer)
-            const publicId = (currentBannerConfig && currentBannerConfig.publicId) || 'unknown'; 
+            const publicId = baseConfig.publicId || 'unknown'; 
             
             newConfig.specific_banners[file] = {
                 publicId: publicId,
-                // Preserva o dia existente, ou usa o dia novo (se fornecido), ou 'random' se for ativação
-                day: day || (currentBannerConfig ? currentBannerConfig.day : 'random') 
+                // NOVO: Prioriza o valor de 'day' enviado, senão o existente, senão 'random'
+                day: day || baseConfig.day || 'random', 
+                // NOVO: Prioriza o valor de 'priority' enviado, senão o existente, senão 999
+                priority: priority !== undefined ? priority : (baseConfig.priority || 999) 
             };
             
         } else {
@@ -243,7 +240,7 @@ app.put('/api/config/banners', async (req, res) => {
             method: 'PUT',
             headers: {
                 'Content-Type': 'application/json',
-                'X-Master-Key': apiKey 
+                'X-Master-Key': process.env.JSONBIN_MASTER_KEY 
             },
             body: JSON.stringify(newConfig) 
         });
@@ -253,11 +250,16 @@ app.put('/api/config/banners', async (req, res) => {
             throw new Error(`Falha ao atualizar JSON Bin. Status: ${response.status}. Body: ${errorBody}`);
         }
 
+        // Retorna a nova config para confirmação
+        const updatedConfig = newConfig.specific_banners[file] === false ? { day: baseConfig.day || 'random', priority: baseConfig.priority || 999 } : newConfig.specific_banners[file];
+
         res.json({ 
             success: true, 
             new_state: active, 
             banner_file: file, 
-            message: `Estado e/ou dia do banner ${file} atualizado com sucesso.` 
+            new_day: updatedConfig.day,
+            new_priority: updatedConfig.priority,
+            message: `Configuração do banner ${file} atualizada com sucesso.` 
         });
     } catch (error) {
         console.error('Erro de escrita no JSON Bin:', error);
