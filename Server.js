@@ -200,7 +200,6 @@ app.get('/api/banners', async (req, res) => {
     }
 });
 
-// --- ROTA 2: API PARA OBTER LISTA COMPLETA DE BANNERS E STATUS (PAINEL) ---
 app.get('/api/config/banners/list', async (req, res) => {
     
     try {
