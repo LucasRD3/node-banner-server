@@ -1,14 +1,11 @@
-// server.js (ATUALIZADO PARA VERCEL + LUXON)
+// server.js (ATUALIZADO COM CHAVE DE ATIVAÇÃO)
 
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
 const cors = require('cors'); 
-const { DateTime } = require('luxon'); // ✅ NOVO: Importa Luxon
+const { DateTime } = require('luxon'); // ✅ Importa Luxon
 const app = express();
-
-// --- REMOVIDO: Porta Dinâmica (Não é necessário em Serverless Functions) ---
-// const PORT = process.env.PORT || 3000; 
 
 // --- Configuração CORS ---
 app.use(cors()); 
@@ -21,12 +18,6 @@ app.use(express.static(path.join(__dirname, 'banners')));
 // === Mapeamento de Banners por Dia da Semana (BannerDoDia) ===
 // =========================================================================
 
-/**
- * Mapeia o dia da semana (retornado por new Date().getDay() ou Luxon) para o nome 
- * do arquivo de banner correspondente.
- * * Dias (JavaScript/Luxon): 1=Segunda, 2=Terça... 6=Sábado, 7=Domingo.
- * * NOTA: O Luxon usa 1-7, diferente do padrão JS (0-6). Mapeamento ajustado.
- */
 const BannerDoDia = {
     7: 'banner_domingo.png',  // Domingo (Day 7 em Luxon)
     1: 'banner_segunda.png',  // Segunda-feira (Day 1 em Luxon)
@@ -39,19 +30,32 @@ const BannerDoDia = {
 
 
 // --- 2. ROTA API PARA OBTER OS BANNERS ---
-// Esta rota retorna: 1. O Banner do Dia (se houver), seguido por 2. Outros Banners Genéricos.
 app.get('/api/banners', (req, res) => {
     const bannersDir = path.join(__dirname, 'banners');
     
-    // 🎯 NOVO: Obtém o dia atual no fuso horário específico (America/Sao_Paulo)
+    // Obtém o dia atual e o banner esperado para manter o debug útil
     const today = DateTime.local().setZone('America/Sao_Paulo').weekday; // 1 (Seg) a 7 (Dom)
-    
-    // Nome do arquivo esperado para o dia de hoje
     const bannerFilenameToday = BannerDoDia[today]; 
-    // Lista de todos os nomes de banners específicos da semana
-    const allDailyBanners = Object.values(BannerDoDia); 
+
+    // =======================================================
+    // 🛑 PASSO 1A: CHECAGEM DA VARIÁVEL DE AMBIENTE PARA DESATIVAÇÃO
+    // Se BANNERS_ACTIVE for estritamente a string 'false', desativa os banners.
+    const isBannersActive = process.env.BANNERS_ACTIVE !== 'false';
     
-    // --- ✅ AJUSTE VERCEL: A URL base é inferida. ---
+    if (!isBannersActive) {
+        // Retorna um JSON vazio e uma mensagem de debug
+        return res.json({ 
+            banners: [],
+            debug: {
+                currentDay: today,
+                timezone: 'America/Sao_Paulo',
+                expectedBanner: 'DESATIVADO por BANNERS_ACTIVE=false' 
+            }
+        });
+    }
+    // =======================================================
+
+    const allDailyBanners = Object.values(BannerDoDia); 
     const baseUrl = req.protocol + '://' + req.get('host');
 
     fs.readdir(bannersDir, (err, files) => {
@@ -60,7 +64,6 @@ app.get('/api/banners', (req, res) => {
             return res.status(500).json({ error: 'Falha ao carregar banners.' });
         }
 
-        // Variáveis para armazenar as URLs
         let dailyBannerUrl = [];
         const genericBannerUrls = [];
 
@@ -71,18 +74,16 @@ app.get('/api/banners', (req, res) => {
 
         // 2. Classifica os arquivos
         imageFiles.forEach(file => {
-            // A. É o banner que deve ser exibido hoje? (Prioridade 1: Exibe sempre no início)
+            // A. É o banner que deve ser exibido hoje?
             if (file === bannerFilenameToday) {
                 dailyBannerUrl.push(`${baseUrl}/${file}`);
             } 
-            // B. Não é um banner mapeado para NENHUM dia da semana? (Prioridade 2: Banners Genéricos)
+            // B. Não é um banner mapeado para NENHUM dia da semana?
             else if (!allDailyBanners.includes(file)) {
                 genericBannerUrls.push(`${baseUrl}/${file}`);
             }
-            // C. Se for um banner de outro dia (ex: banner_terca.png na segunda), ele é IGUALMENTE IGNORADO.
         });
 
-        // 3. Combina: Banner do Dia (0 ou 1 item) + Outros Banners Genéricos
         const finalBannerUrls = [...dailyBannerUrl, ...genericBannerUrls];
 
         if (finalBannerUrls.length === 0) {
@@ -91,7 +92,6 @@ app.get('/api/banners', (req, res) => {
 
         res.json({ 
             banners: finalBannerUrls,
-            // ℹ️ Adiciona o dia e o fuso horário atual à resposta para debug/verificação
             debug: {
                 currentDay: today,
                 timezone: 'America/Sao_Paulo',
@@ -101,12 +101,4 @@ app.get('/api/banners', (req, res) => {
     });
 });
 
-// --- ❌ REMOVIDO: app.listen(). Em Vercel, a função Serverless cuida disso. ---
-/*
-app.listen(PORT, () => {
-    console.log(`🚀 Servidor rodando na porta: ${PORT}`);
-});
-*/
-
-// --- ✅ EXPORTAÇÃO VERCEL: Exporta o aplicativo Express. ---
 module.exports = app;
