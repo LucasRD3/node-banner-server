@@ -1,26 +1,15 @@
-// server.js (AGORA USANDO UPSTASH REDIS EM VEZ DE JSONBIN)
+// server.js (CONTROLE INDIVIDUAL POR ARQUIVO DINÂMICO COM CLOUDINARY)
 
 const express = require('express');
 const cors = require('cors'); 
 const { DateTime } = require('luxon');
-const fetch = require('node-fetch'); // Mantido, mas não usado para o estado
+const fetch = require('node-fetch'); 
 const cloudinary = require('cloudinary').v2;
 const multer = require('multer');           
-const Redis = require('ioredis'); // NOVO: Importa ioredis
 const app = express();
 
 app.use(express.json()); 
 app.use(cors()); 
-
-// =========================================================================
-// === CONFIGURAÇÃO UPSTASH REDIS ===
-// =========================================================================
-
-// Conecta ao Upstash usando a URL completa (process.env.REDIS_URL deve ser definido no Vercel)
-const redisClient = new Redis(process.env.REDIS_URL); 
-
-// Chave única onde o objeto de configuração JSON será armazenado no Redis
-const REDIS_CONFIG_KEY = 'global:banner_config_state';
 
 // --- CONFIGURAÇÃO CLOUDINARY ---
 cloudinary.config({
@@ -34,53 +23,30 @@ const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
 // =========================================================================
-// === FUNÇÕES DE CONFIGURAÇÃO REMOTA (REDIS) ===
+// === FUNÇÕES DE CONFIGURAÇÃO REMOTA (JSONBIN) ===
 // =========================================================================
 
-/**
- * Busca a configuração de banners do Redis.
- * @returns {Promise<{specific_banners: Object}>} Configuração atual.
- */
+const JSONBIN_URL = `https://api.jsonbin.io/v3/b/${process.env.JSONBIN_BIN_ID}/latest`;
+const JSONBIN_WRITE_URL = `https://api.jsonbin.io/v3/b/${process.env.JSONBIN_BIN_ID}`;
+
 async function getBannerConfig() {
+    // MODIFICADO: Estrutura simplificada, sem banners diários
     const defaultFallback = { specific_banners: {} }; 
     
-    try {
-        // 1. Pega a string JSON do Redis
-        const configString = await redisClient.get(REDIS_CONFIG_KEY);
-        
-        if (configString) {
-            // 2. Converte a string de volta para objeto
-            const data = JSON.parse(configString);
-            return { 
-                specific_banners: data.specific_banners || {} 
-            }; 
-        }
-        
-        // 3. Se não houver dados, retorna o fallback e salva (inicia) no Redis
-        await setBannerConfig(defaultFallback);
-        return defaultFallback; 
-    } catch (error) {
-        console.error('Falha ao buscar estado de banners no Redis:', error.message);
-        return defaultFallback; 
+    if (!process.env.JSONBIN_BIN_ID) {
+        return defaultFallback;
     }
-}
-
-/**
- * Salva a nova configuração no Redis.
- * @param {Object} config - O objeto de configuração a ser salvo.
- * @returns {Promise<void>}
- */
-async function setBannerConfig(config) {
+    
     try {
-        // 1. Converte o objeto de configuração para string JSON
-        const configString = JSON.stringify(config);
+        const response = await fetch(JSONBIN_URL);
+        const data = await response.json();
         
-        // 2. Salva a string no Redis
-        await redisClient.set(REDIS_CONFIG_KEY, configString);
-        
+        return data.record ? { 
+            specific_banners: data.record.specific_banners || {} 
+        } : defaultFallback; 
     } catch (error) {
-        console.error('Falha ao salvar estado de banners no Redis:', error.message);
-        throw new Error('Falha ao salvar configuração no banco de dados.'); 
+        console.error('Falha ao buscar estado de banners no JSON Bin:', error.message);
+        return defaultFallback; 
     }
 }
 
@@ -115,11 +81,23 @@ app.post('/api/banners/upload', upload.single('bannerFile'), async (req, res) =>
         newConfig.specific_banners[newBannerUrl] = {
             publicId: newBannerPublicId,
             day: 'random', 
-            priority: 999 
+            priority: 999 // NOVO: Prioridade baixa por padrão (aparecerá por último)
         }; 
         
-        // 4. Salva a nova configuração no REDIS
-        await setBannerConfig(newConfig);
+        // 4. Salva a nova configuração no JSON Bin
+        const jsonBinResponse = await fetch(JSONBIN_WRITE_URL, {
+            method: 'PUT',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Master-Key': process.env.JSONBIN_MASTER_KEY 
+            },
+            body: JSON.stringify(newConfig)
+        });
+        
+        if (!jsonBinResponse.ok) {
+            const errorBody = await jsonBinResponse.text();
+            throw new Error(`Falha ao atualizar JSON Bin após upload. Status: ${jsonBinResponse.status}. Body: ${errorBody}`);
+        }
 
         res.json({ 
             success: true, 
@@ -129,7 +107,7 @@ app.post('/api/banners/upload', upload.single('bannerFile'), async (req, res) =>
         });
         
     } catch (error) {
-        console.error('Erro no upload para Cloudinary/Redis:', error);
+        console.error('Erro no upload para Cloudinary/JSON Bin:', error);
         res.status(500).json({ success: false, error: `Falha interna ao salvar configuração: ${error.message}` });
     }
 });
@@ -165,7 +143,7 @@ app.get('/api/banners', async (req, res) => {
         }
     });
     
-    // 2. Ordena a lista de banners ativos pela prioridade (menor número = maior prioridade)
+    // 2. NOVO: Ordena a lista de banners ativos pela prioridade (menor número = maior prioridade)
     activeBanners.sort((a, b) => a.priority - b.priority);
 
     // 3. Extrai apenas os URLs para a resposta final
@@ -188,36 +166,36 @@ app.get('/api/config/banners/list', async (req, res) => {
     
     let bannerList = [];
 
-    // 1. Adiciona Banners Genéricos (lidos do Cloudinary/Redis)
+    // 1. Adiciona Banners Genéricos (lidos do JSON Bin/Cloudinary)
     Object.keys(specificStatuses).forEach(url => {
         const bannerConfig = specificStatuses[url];
         
         const isActive = bannerConfig && bannerConfig !== false; 
         
         const day = isActive ? (bannerConfig.day || 'random') : 'random'; 
+        // NOVO: Adiciona o campo priority
         const priority = isActive ? (bannerConfig.priority || 999) : 999; 
-        const publicId = isActive ? (bannerConfig.publicId || 'unknown') : (bannerConfig && bannerConfig.publicId ? bannerConfig.publicId : 'unknown'); 
         
         bannerList.push({
             fileName: url, 
             isDailyBanner: false, 
             isActive: isActive,
             day: day, 
-            priority: priority, 
-            publicId: publicId // Passa o publicId para o frontend usar na deleção
+            priority: priority // NOVO: Campo de Prioridade
         });
     });
     
-    // Ordena a lista para exibição no painel pela prioridade (1º a 999º)
+    // NOVO: Ordena a lista para exibição no painel pela prioridade (1º a 999º)
     bannerList.sort((a, b) => a.priority - b.priority);
 
     res.json({
-        config: {}, 
+        config: {}, // Sem daily_banners_active
         banners: bannerList
     });
 });
 
 // --- ROTA 3: API PARA ATUALIZAR CONFIGURAÇÃO (ESCRITA DO PAINEL) ---
+// Agora lida com 'active', 'day' e 'priority'
 app.put('/api/config/banners', async (req, res) => {
     
     const { file, active, day, priority } = req.body; 
@@ -226,6 +204,9 @@ app.put('/api/config/banners', async (req, res) => {
         return res.status(400).json({ success: false, error: 'O campo "active" deve ser booleano e "file" (URL) deve ser fornecido.' });
     }
 
+    const url = JSONBIN_WRITE_URL; 
+    const apiKey = process.env.JSONBIN_MASTER_KEY; 
+    
     try {
         const currentConfig = await getBannerConfig();
         const newConfig = { ...currentConfig };
@@ -243,7 +224,9 @@ app.put('/api/config/banners', async (req, res) => {
             
             newConfig.specific_banners[file] = {
                 publicId: publicId,
+                // NOVO: Prioriza o valor de 'day' enviado, senão o existente, senão 'random'
                 day: day || baseConfig.day || 'random', 
+                // NOVO: Prioriza o valor de 'priority' enviado, senão o existente, senão 999
                 priority: priority !== undefined ? priority : (baseConfig.priority || 999) 
             };
             
@@ -252,8 +235,20 @@ app.put('/api/config/banners', async (req, res) => {
             newConfig.specific_banners[file] = false;
         }
 
-        // SALVA NO REDIS
-        await setBannerConfig(newConfig);
+
+        const response = await fetch(url, {
+            method: 'PUT',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Master-Key': process.env.JSONBIN_MASTER_KEY 
+            },
+            body: JSON.stringify(newConfig) 
+        });
+
+        if (!response.ok) {
+            const errorBody = await response.text();
+            throw new Error(`Falha ao atualizar JSON Bin. Status: ${response.status}. Body: ${errorBody}`);
+        }
 
         // Retorna a nova config para confirmação
         const updatedConfig = newConfig.specific_banners[file] === false ? { day: baseConfig.day || 'random', priority: baseConfig.priority || 999 } : newConfig.specific_banners[file];
@@ -267,48 +262,63 @@ app.put('/api/config/banners', async (req, res) => {
             message: `Configuração do banner ${file} atualizada com sucesso.` 
         });
     } catch (error) {
-        console.error('Erro de escrita no Redis:', error);
+        console.error('Erro de escrita no JSON Bin:', error);
         res.status(500).json({ success: false, error: `Falha interna ao salvar configuração: ${error.message}` });
     }
 });
 
-// --- ROTA 4: API PARA DELETAR BANNER (Deleta do Cloudinary e do Redis) ---
-app.delete('/api/banners/delete', async (req, res) => {
-    const { url, publicId } = req.body; // Recebe a URL e o Public ID
 
-    if (!url || !publicId) {
+// --- ROTA 4: API PARA EXCLUSÃO DE BANNER (Cloudinary + JSON Bin) ---
+app.delete('/api/banners/delete', async (req, res) => {
+    const { fileUrl, publicId } = req.body;
+    
+    // O publicId é necessário para o Cloudinary, o fileUrl é usado para remover da config.
+    if (!fileUrl || !publicId) {
+        // Esta mensagem de erro é a que o seu frontend estava recebendo.
         return res.status(400).json({ success: false, error: 'URL e publicId do banner são obrigatórios para a deleção.' });
     }
 
     try {
-        // 1. Deleta a imagem do Cloudinary
+        // 1. Deleção do Cloudinary
+        // publicId deve incluir a pasta, ex: 'site_banners/nome_do_arquivo'
         const cloudinaryResult = await cloudinary.uploader.destroy(publicId);
-        
-        if (cloudinaryResult.result !== 'ok' && cloudinaryResult.result !== 'not found') {
-            console.warn(`Aviso: Cloudinary retornou: ${cloudinaryResult.result} para ${publicId}`);
-            // Continuamos, pois o principal é remover do Redis
+
+        if (cloudinaryResult.result === 'not found') {
+            console.warn(`Cloudinary: Banner com publicId ${publicId} não encontrado, mas será removido da configuração.`);
+        } else if (cloudinaryResult.result !== 'ok' && cloudinaryResult.result !== 'not found') {
+            throw new Error(`Cloudinary falhou: ${cloudinaryResult.result}`);
         }
-        
-        // 2. Remove a referência do Redis
+
+        // 2. Busca e Atualiza a configuração no JSON Bin
         const currentConfig = await getBannerConfig();
+        const newConfig = { ...currentConfig };
         
-        if (currentConfig.specific_banners && currentConfig.specific_banners[url]) {
-            delete currentConfig.specific_banners[url]; // Remove a chave (URL) do objeto
-            
-            // 3. Salva a nova configuração (sem o banner) no Redis
-            await setBannerConfig(currentConfig);
+        // Remove a entrada da configuração usando a URL (chave)
+        if (newConfig.specific_banners && newConfig.specific_banners[fileUrl]) {
+            delete newConfig.specific_banners[fileUrl];
         } else {
-            console.warn(`Banner ${url} não encontrado na configuração do Redis.`);
+            console.warn(`Banner com URL ${fileUrl} não encontrado na configuração, mas continua a deleção.`);
+        }
+        
+        // 3. Salva a nova configuração no JSON Bin
+        const jsonBinResponse = await fetch(JSONBIN_WRITE_URL, {
+            method: 'PUT',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Master-Key': process.env.JSONBIN_MASTER_KEY 
+            },
+            body: JSON.stringify(newConfig)
+        });
+        
+        if (!jsonBinResponse.ok) {
+            const errorBody = await jsonBinResponse.text();
+            throw new Error(`Falha ao atualizar JSON Bin após deleção. Status: ${jsonBinResponse.status}. Body: ${errorBody}`);
         }
 
-        res.json({ 
-            success: true, 
-            message: `Banner ${publicId} deletado do Cloudinary e removido da configuração do Redis.`,
-            cloudinaryStatus: cloudinaryResult.result
-        });
-
+        res.json({ success: true, message: `Banner ${publicId} excluído com sucesso do Cloudinary e da lista.` });
+        
     } catch (error) {
-        console.error('Erro ao deletar banner (Cloudinary/Redis):', error);
+        console.error('Erro na exclusão do banner:', error);
         res.status(500).json({ success: false, error: `Falha interna ao deletar banner: ${error.message}` });
     }
 });
